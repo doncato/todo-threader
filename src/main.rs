@@ -1,7 +1,8 @@
 use clap::{self, Arg, Command};
 use env_logger::Builder;
 use log::LevelFilter;
-use serial::prelude::*;
+use rand::Rng;
+use serialport;
 use std::io::Read;
 use std::io::Write;
 use std::time::Duration;
@@ -74,8 +75,14 @@ fn get_args() -> clap::ArgMatches {
                 .help("Set a task and schedule it as the next one")
                 .takes_value(true)
                 .value_name("TASK")
-                .requires("Color")
                 .conflicts_with_all(&["Test", "Next", "Add"]),
+        )
+        .arg(
+            Arg::new("Swap")
+                .short('s')
+                .long("swap")
+                .help("Swap the current task with the next one")
+                .conflicts_with_all(&["Test", "Next", "Add", "Following"]),
         )
         .arg(
             Arg::new("Add")
@@ -84,7 +91,6 @@ fn get_args() -> clap::ArgMatches {
                 .help("Set a task and schedule it at the end")
                 .takes_value(true)
                 .value_name("TASK")
-                .requires("Color")
                 .conflicts_with_all(&["Test", "Next", "Following"]),
         )
         .arg(
@@ -94,7 +100,15 @@ fn get_args() -> clap::ArgMatches {
                 .help("Set the color for a new Task in HTML notation")
                 .takes_value(true)
                 .value_name("COLOR")
+                .required_unless_present_any(&["Random", "Swap", "Next", "Test", "Raw"])
                 .default_value("#FFFFFF"),
+        )
+        .arg(
+            Arg::new("Random")
+                .short('R')
+                .long("random")
+                .help("Randomize the color for a new Task")
+                .conflicts_with("Color"),
         )
         .get_matches()
 }
@@ -106,40 +120,15 @@ fn init_logger(level: LevelFilter) {
         .init();
 }
 
-fn init_comm_settings(baudrate: usize) -> serial::PortSettings {
-    let baud = match baudrate {
-        110 => serial::Baud110,
-        300 => serial::Baud300,
-        1200 => serial::Baud1200,
-        2400 => serial::Baud2400,
-        4800 => serial::Baud4800,
-        9600 => serial::Baud9600,
-        19200 => serial::Baud19200,
-        38400 => serial::Baud38400,
-        57600 => serial::Baud57600,
-        115200 => serial::Baud115200,
-        b => serial::BaudOther(b),
-    };
-
-    serial::PortSettings {
-        baud_rate: baud,
-        char_size: serial::Bits8,
-        parity: serial::ParityNone,
-        stop_bits: serial::Stop1,
-        flow_control: serial::FlowNone,
-    }
-}
-
 fn init_communication(
     address: &str,
-    settings: &serial::PortSettings,
-    timeout: u64,
-) -> Result<serial::SystemPort, serial::Error> {
-    let mut device = serial::open(address)?;
-    device.configure(settings)?;
-    device.set_timeout(Duration::from_millis(timeout))?;
-
-    Ok(device)
+    baud: u32,
+    timeout: Duration,
+) -> Result<Box<dyn serialport::SerialPort>, serialport::Error> {
+    serialport::new(address, baud)
+        .timeout(timeout)
+        .flow_control(serialport::FlowControl::Software)
+        .open()
 }
 
 fn main() {
@@ -156,12 +145,11 @@ fn main() {
     init_logger(llvl);
 
     // Build Communication Settings
-    let settings = init_comm_settings(
-        args.value_of("Baud_Rate")
-            .expect("Unexpected")
-            .parse::<usize>()
-            .expect("Provided Baud Rate must be an integer"),
-    );
+    let baud = args
+        .value_of("Baud_Rate")
+        .expect("Unexpected")
+        .parse::<u32>()
+        .expect("Provided Baud Rate must be an integer");
     let timeout = args
         .value_of("Timeout")
         .expect("Unexpected")
@@ -169,7 +157,7 @@ fn main() {
         .expect("Provided Timeout must be an integer");
     let address = args.value_of("Serial_Port").expect("Unexpected");
 
-    let mut device = match init_communication(&address, &settings, timeout) {
+    let mut device = match init_communication(&address, baud, Duration::from_millis(timeout)) {
         Ok(val) => val,
         Err(err) => panic!(
             "Failed to initialize communication with the Device! Reason: {}",
@@ -177,14 +165,23 @@ fn main() {
         ),
     };
 
+    device.write_data_terminal_ready(false).unwrap();
+    device.write_request_to_send(false).unwrap();
+
     if args.is_present("Test") {
         test(&mut device)
     } else if args.is_present("Raw") {
         raw(&mut device, args.value_of("Raw").expect("Unexpected"));
-    } else if args.is_present("Next") || args.is_present("Following") || args.is_present("Add") {
+    } else if args.is_present("Next")
+        || args.is_present("Swap")
+        || args.is_present("Following")
+        || args.is_present("Add")
+    {
         for i in 0..RETRIES {
             let val = if args.is_present("Next") {
                 next(&mut device)
+            } else if args.is_present("Swap") {
+                swap(&mut device)
             } else if args.is_present("Following") {
                 following(
                     &mut device,
@@ -192,10 +189,17 @@ fn main() {
                     args.value_of("Color").expect("Unexpected"),
                 )
             } else {
+                let color: String = if args.is_present("Random") {
+                    let mut rng = rand::thread_rng();
+                    let num: u32 = rng.gen_range(0..16777215);
+                    format!("#{:X}", num)
+                } else {
+                    args.value_of("Color").expect("Unexpected").to_string()
+                };
                 add(
                     &mut device,
                     args.value_of("Add").expect("Unexpected"),
-                    args.value_of("Color").expect("Unexpected"),
+                    &color,
                 )
             };
             if val.is_ok() {
@@ -209,7 +213,7 @@ fn main() {
     }
 }
 
-fn test(device: &mut serial::SystemPort) {
+fn test(device: &mut Box<dyn serialport::SerialPort>) {
     log::debug!("Starting communication test...");
     log::debug!("Sending data to device...");
     match device.write("ping".as_bytes()) {
@@ -237,7 +241,7 @@ fn test(device: &mut serial::SystemPort) {
     log::debug!("Communication test finished");
 }
 
-fn raw(device: &mut serial::SystemPort, payload: &str) {
+fn raw(device: &mut Box<dyn serialport::SerialPort>, payload: &str) {
     match device.write(payload.as_bytes()) {
         Ok(num) => log::info!("Successfully sent {} bytes to the device", num),
         Err(err) => log::error!("Failed to sent data to the device! Reason: {}", err),
@@ -253,15 +257,22 @@ fn raw(device: &mut serial::SystemPort, payload: &str) {
     }
 }
 
-fn next(device: &mut serial::SystemPort) -> Result<(), std::io::Error> {
+fn next(device: &mut Box<dyn serialport::SerialPort>) -> Result<(), std::io::Error> {
     device.write("NXT".as_bytes())?;
     let mut read_buffer = [0u8; 1];
     device.read(&mut read_buffer)?;
     Ok(())
 }
 
+fn swap(device: &mut Box<dyn serialport::SerialPort>) -> Result<(), std::io::Error> {
+    device.write("SWP".as_bytes())?;
+    let mut read_buffer = [0u8; 1];
+    device.read(&mut read_buffer)?;
+    Ok(())
+}
+
 fn following(
-    device: &mut serial::SystemPort,
+    device: &mut Box<dyn serialport::SerialPort>,
     message: &str,
     color: &str,
 ) -> Result<(), std::io::Error> {
@@ -278,7 +289,11 @@ fn following(
     Ok(())
 }
 
-fn add(device: &mut serial::SystemPort, message: &str, color: &str) -> Result<(), std::io::Error> {
+fn add(
+    device: &mut Box<dyn serialport::SerialPort>,
+    message: &str,
+    color: &str,
+) -> Result<(), std::io::Error> {
     device.write(
         format!(
             "ADD{};{}",
